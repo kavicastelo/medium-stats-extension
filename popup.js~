@@ -1,0 +1,174 @@
+// popup.js
+const collectBtn = document.getElementById("collect");
+const fetchBtn = document.getElementById("fetchLast");
+const exportBtn = document.getElementById("export");
+const statusEl = document.getElementById("status");
+const totalsEl = document.getElementById("totals");
+const sampleEl = document.getElementById("sample");
+const summaryDiv = document.getElementById("summary");
+const chart = document.getElementById("chart");
+let lastResult = null;
+
+function showStatus(msg) { statusEl.textContent = msg; }
+
+function drawSimpleBar(labels, values) {
+    const ctx = chart.getContext("2d");
+    ctx.clearRect(0,0,chart.width, chart.height);
+    const w = chart.width, h = chart.height, padding = 40;
+    const max = Math.max(...values, 1);
+    const barW = (w - padding*2) / labels.length * 0.6;
+    labels.forEach((lbl,i) => {
+        const x = padding + i * ((w - padding*2)/labels.length) + ((w - padding*2)/labels.length - barW)/2;
+        const barH = (values[i] / max) * (h - padding*2);
+        const y = h - padding - barH;
+        ctx.fillStyle = "#2b7cff";
+        ctx.fillRect(x,y,barW,barH);
+        ctx.fillStyle="#000"; ctx.font="12px Arial"; ctx.textAlign="center";
+        ctx.fillText(lbl, x+barW/2, h - padding + 14);
+        ctx.fillText(values[i].toLocaleString(), x+barW/2, y - 6);
+    });
+}
+
+function toCSV(result) {
+    const header = ["title","id","href","presentations","views","reads","claps","followersGained","subscribersGained"];
+    const rows = result.stats.map(s => header.map(h => (s[h] ?? "").toString().replace(/"/g,'""')));
+    const csv = [header.join(",")].concat(rows.map(r => `"${r.join('","')}"`)).join("\n");
+    return csv;
+}
+
+// helper: ask content script to gather visible posts, returns items array
+async function askContentToGather(tabId) {
+    return new Promise((resolve) => {
+        chrome.tabs.sendMessage(tabId, { action: "collectNow" }, (resp) => {
+            if (chrome.runtime.lastError) {
+                resolve({ error: chrome.runtime.lastError.message });
+            } else {
+                resolve(resp || { ok: true });
+            }
+        });
+    });
+}
+
+collectBtn.addEventListener("click", async () => {
+    showStatus("Collecting post IDs from this tab...");
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !/medium\.com\/.*me\/stats/i.test(tab.url || "")) {
+        showStatus("Open the Medium stats page (https://medium.com/me/stats...) and try again.");
+        return;
+    }
+
+    // Ask content script to gather items and also send them to background automatically.
+    // We still need list of items here - so fetch lastMediumStats from storage, or ask background to read stored items
+    // Approach: ask content to gather IDs (it will send items to background), then request background to get last stored items and then trigger collect.
+    const gatherResp = await askContentToGather(tab.id);
+    if (gatherResp && gatherResp.error) {
+        showStatus("Content script error: " + gatherResp.error);
+        return;
+    }
+
+    // Retrieve the collected post items from the page by querying anchors ourselves (just to ensure we have items)
+    const getItemsFromTab = () => new Promise(resolve => {
+        chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: () => {
+                const anchors = Array.from(document.querySelectorAll('a[href*="/me/stats/post/"], a[href*="/p/"], a[href*="/post/"]'));
+                const uniq = [];
+                const seen = new Set();
+                anchors.forEach(a => {
+                    const href = a.href.split("?")[0];
+                    if (seen.has(href)) return;
+                    seen.add(href);
+                    const title = (a.querySelector("h2, h3") || a.closest("article")?.querySelector("h2, h3") || a).innerText || "";
+                    uniq.push({ href, title });
+                });
+                return uniq;
+            }
+        }, (injectionResults) => {
+            if (chrome.runtime.lastError) return resolve([]);
+            resolve(injectionResults?.[0]?.result || []);
+        });
+    });
+
+    const anchors = await getItemsFromTab();
+    if (!anchors.length) {
+        showStatus("No posts found on this page (wait for the page to fully load).");
+        return;
+    }
+
+    // Normalize and extract IDs
+    const items = anchors.map(a => {
+        try {
+            const u = new URL(a.href, tab.url);
+            let m = u.pathname.match(/\/me\/stats\/post\/([^/]+)/) || u.pathname.match(/\/p\/([A-Za-z0-9]+)/) || u.pathname.match(/-([a-f0-9]{12,})$/i);
+            const id = m ? m[1] : null;
+            return id ? { id, title: a.title || "Untitled", href: a.href } : null;
+        } catch (e) { return null; }
+    }).filter(Boolean);
+
+    // send items to background to collect
+    showStatus(`Sending ${items.length} posts to background for GraphQL fetch...`);
+    chrome.runtime.sendMessage({ action: "collect", posts: items }, (resp) => {
+        if (chrome.runtime.lastError) {
+            showStatus("Background error: " + chrome.runtime.lastError.message);
+            return;
+        }
+        if (resp && resp.result) {
+            lastResult = resp.result;
+            renderResult(lastResult);
+            showStatus(`Collected ${lastResult.count} items.`);
+            exportBtn.disabled = !(lastResult && lastResult.stats && lastResult.stats.length);
+        } else if (resp && resp.error) {
+            showStatus("Error: " + resp.error);
+        } else {
+            showStatus("No response from background.");
+        }
+    });
+});
+
+fetchBtn.addEventListener("click", () => {
+    chrome.runtime.sendMessage({ action: "getLast" }, (resp) => {
+        if (resp) {
+            lastResult = resp;
+            if (resp) {
+                renderResult(resp);
+                showStatus("Loaded stored results.");
+                exportBtn.disabled = !(resp && resp.stats && resp.stats.length);
+            } else {
+                showStatus("No stored results found.");
+            }
+        } else {
+            showStatus("No stored results.");
+        }
+    });
+});
+
+exportBtn.addEventListener("click", () => {
+    if (!lastResult) return;
+    const csv = toCSV(lastResult);
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "medium-stats.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+});
+
+
+function renderResult(res) {
+    if (!res) return;
+    summaryDiv.style.display = "block";
+    totalsEl.textContent = JSON.stringify(res.totals, null, 2);
+    sampleEl.textContent = (res.stats || []).slice(0,50).map(s => `${s.title}\n  presentations:${s.presentations} views:${s.views} reads:${s.reads} claps:${s.claps} followersGained:${s.followersGained}`).join("\n\n");
+
+    const labels = ["Presentations","Views","Reads","Claps","FollowersGained","SubscribersGained"];
+    const values = [
+        res.totals.presentations || 0,
+        res.totals.views || 0,
+        res.totals.reads || 0,
+        res.totals.claps || 0,
+        res.totals.followersGained || 0,
+        res.totals.subscribersGained || 0
+    ];
+    drawSimpleBar(labels, values);
+}

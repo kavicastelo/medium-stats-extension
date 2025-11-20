@@ -1,0 +1,27 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Medium Stats Collector</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<h2>Medium Stats Collector</h2>
+<div id="status">Open Medium <code>/me/stats</code> page before collecting.</div>
+<div class="controls">
+    <button id="collect">Collect</button>
+    <button id="fetchLast">Load Last</button>
+    <button id="export" disabled>Export CSV</button>
+</div>
+
+<div id="summary" style="display:none">
+    <h3>Totals</h3>
+    <pre id="totals"></pre>
+    <canvas id="chart" width="560" height="240"></canvas>
+    <h3>Per-article (first 50)</h3>
+    <pre id="sample"></pre>
+</div>
+
+<script src="popup.js"></script>
+</body>
+</html>
