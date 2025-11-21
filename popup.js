@@ -1,5 +1,6 @@
 // popup.js
 const collectBtn = document.getElementById("collect");
+const collectAllBtn = document.getElementById("collectAll");
 const fetchBtn = document.getElementById("fetchLast");
 const exportBtn = document.getElementById("export");
 const statusEl = document.getElementById("status");
@@ -115,6 +116,58 @@ collectBtn.addEventListener("click", async () => {
     });
 });
 
+collectAllBtn.addEventListener("click", async () => {
+    showStatus("Scrolling & gathering ALL posts…");
+
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab || !/medium\.com\/.*me\/stats/i.test(tab.url || "")) {
+        showStatus("Open https://medium.com/me/stats first.");
+        return;
+    }
+
+    try {
+        // Inject the scrolling collector directly into the page
+        const [{ result }] = await chrome.scripting.executeScript({
+            target: { tabId: tab.id },
+            func: collectPaginatedInjected
+        });
+
+        if (!result || !Array.isArray(result)) {
+            showStatus("Failed to collect posts.");
+            return;
+        }
+
+        const items = result.map(a => {
+            const m =
+                a.href.match(/\/me\/stats\/post\/([^/]+)/) ||
+                a.href.match(/\/p\/([A-Za-z0-9]+)/) ||
+                a.href.match(/-([a-f0-9]{12,})$/i);
+            return m ? { id: m[1], title: a.title, href: a.href } : null;
+        }).filter(Boolean);
+
+        showStatus(`Collected ${items.length} posts. Fetching stats…`);
+
+        chrome.runtime.sendMessage({ action: "collect", posts: items }, (resp) => {
+            if (chrome.runtime.lastError) {
+                showStatus("Background error: " + chrome.runtime.lastError.message);
+                return;
+            }
+            if (resp?.result) {
+                lastResult = resp.result;
+                renderResult(lastResult);
+                showStatus(`Done! ${lastResult.count} posts.`);
+                exportBtn.disabled = false;
+            } else {
+                showStatus("Background returned no data.");
+            }
+        });
+
+    } catch (err) {
+        console.error(err);
+        showStatus("Script injection failed: " + err.message);
+    }
+});
+
 fetchBtn.addEventListener("click", () => {
     chrome.runtime.sendMessage({ action: "getLast" }, (resp) => {
         if (resp) {
@@ -144,21 +197,109 @@ exportBtn.addEventListener("click", () => {
     URL.revokeObjectURL(url);
 });
 
+// Tab switching
+document.querySelectorAll(".tab").forEach(btn => {
+    btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+        btn.classList.add("active");
+
+        document.querySelectorAll(".tabContent").forEach(c => c.classList.remove("active"));
+        document.getElementById(btn.dataset.tab).classList.add("active");
+    });
+});
+
+function renderTotals(totals) {
+    const grid = document.getElementById("totalsGrid");
+    grid.innerHTML = `
+        <div><strong>Presentations:</strong> ${totals.presentations}</div>
+        <div><strong>Views:</strong> ${totals.views}</div>
+        <div><strong>Reads:</strong> ${totals.reads}</div>
+        <div><strong>Claps:</strong> ${totals.claps}</div>
+        <div><strong>Followers Gained:</strong> ${totals.followersGained}</div>
+        <div><strong>Subscribers Gained:</strong> ${totals.subscribersGained}</div>
+    `;
+}
+
+function renderTable(stats) {
+    const body = document.querySelector("#articlesTable tbody");
+    body.innerHTML = stats.map(s => `
+        <tr>
+            <td>${s.title}</td>
+            <td>${s.views}</td>
+            <td>${s.reads}</td>
+            <td>${s.claps}</td>
+            <td>${s.followersGained}</td>
+        </tr>
+    `).join("");
+}
 
 function renderResult(res) {
     if (!res) return;
-    summaryDiv.style.display = "block";
-    totalsEl.textContent = JSON.stringify(res.totals, null, 2);
-    sampleEl.textContent = (res.stats || []).slice(0,50).map(s => `${s.title}\n  presentations:${s.presentations} views:${s.views} reads:${s.reads} claps:${s.claps} followersGained:${s.followersGained}`).join("\n\n");
+    renderTotals(res.totals);
+    renderTable(res.stats);
+    drawSimpleBar(
+        ["Presentations","Views","Reads","Claps","Followers","Subs"],
+        [
+            res.totals.presentations,
+            res.totals.views,
+            res.totals.reads,
+            res.totals.claps,
+            res.totals.followersGained,
+            res.totals.subscribersGained
+        ]
+    );
+}
 
-    const labels = ["Presentations","Views","Reads","Claps","FollowersGained","SubscribersGained"];
-    const values = [
-        res.totals.presentations || 0,
-        res.totals.views || 0,
-        res.totals.reads || 0,
-        res.totals.claps || 0,
-        res.totals.followersGained || 0,
-        res.totals.subscribersGained || 0
-    ];
-    drawSimpleBar(labels, values);
+function collectPaginatedInjected() {
+    return (async () => {
+        function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+        function extractItems() {
+            const anchors = Array.from(
+                document.querySelectorAll('a[href*="/me/stats/post/"], a[href*="/p/"], a[href*="/post/"]')
+            );
+
+            const out = [];
+            const seen = new Set();
+
+            anchors.forEach(a => {
+                const href = a.href.split("?")[0];
+                if (seen.has(href)) return;
+                seen.add(href);
+
+                const title =
+                    (a.querySelector("h2, h3") ||
+                        a.closest("article")?.querySelector("h2, h3") ||
+                        a).innerText || "Untitled";
+
+                out.push({ href, title });
+            });
+
+            return out;
+        }
+
+        let lastHeight = 0;
+        let stableCount = 0;
+        const MAX_STABLE = 5;
+        const results = new Map();
+
+        while (true) {
+            window.scrollTo(0, document.body.scrollHeight);
+            await sleep(1200);
+
+            const items = extractItems();
+            items.forEach(i => results.set(i.href, i));
+
+            const height = document.body.scrollHeight;
+            if (height === lastHeight) {
+                stableCount++;
+                if (stableCount >= MAX_STABLE) break;
+            } else {
+                stableCount = 0;
+            }
+            lastHeight = height;
+        }
+
+        return [...results.values()];
+    })();
 }
