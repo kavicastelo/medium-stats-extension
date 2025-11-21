@@ -164,6 +164,57 @@ For each article:
 
 ---
 
+## ⚠️ Troubleshooting
+
+### ❗ “Open Medium stats page first”
+
+Ensure you are on:
+
+```bash
+https://medium.com/me/stats
+```
+
+### ❗ "No posts found"
+
+Possible reasons:
+
+- Stats page still loading
+- You're on a publication dashboard with unusual DOM
+- Medium changed the HTML (rare)
+
+Try:
+
+- Manual scroll once
+- Refresh page
+- Click `Collect ALL`
+
+### ❗ "Background error: Failed to fetch"
+
+This is usually caused by:
+
+- Internet interruption
+- Medium API throttling
+- Session expired → Log out/in to Medium
+
+### ❗ Content script error: Could not establish connection. Receiving end does not exist.
+
+Possible reasons:
+
+- Medium SPA not correctly update the routes
+
+Try:
+
+- Reload the `/me/stats*` or `/me/stats/*` page and try again
+
+### ❗ Auto-scroll stops too early
+
+Try increasing scroll speed:
+
+- Ensure browser is active (Chrome throttles background tabs)
+- Move the tab to foreground
+
+---
+
 ## 🔒 Privacy
 
 - All data is processed **locally in your browser**.
