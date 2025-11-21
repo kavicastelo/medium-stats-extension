@@ -61,7 +61,6 @@ async function gatherAndSend() {
         const id = extractPostIdFromHref(l.href);
         if (!id) continue;
         items.push({ id, title: l.title || "Untitled", href: l.href });
-        console.log(items)
     }
     // send to background
     chrome.runtime.sendMessage({ action: "collectStatsForPosts", posts: items }, (response) => {

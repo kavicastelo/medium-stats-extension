@@ -1,46 +1,44 @@
 // (MV3 service worker)
 
 const GRAPHQL_URL = "https://medium.com/_/graphql";
-const BATCH_SIZE = 10; // how many GraphQL operations per POST body chunk
-const REQUEST_TIMEOUT = 20000; // ms
+const BATCH_SIZE = 10;
+const REQUEST_TIMEOUT = 20000;
 
-// GraphQL operation templates
-const OP_POST_CLAPS = `
-query PostClaps($postId: ID!) {
-  postResult(id: $postId) {
-    id
-    clapCount
-  }
-}
-`;
+// === VALID GraphQL Operations (2025) ================================
 
-const OP_POST_TOTALS = `
-query PostTotals($postId: ID!) {
-  postStatsTotalBundle(postId: $postId) {
+// Combined Funnel + Impact data
+const OP_FULL_STATS = `
+query FullPostStats(
+  $postStatsTotalBundleInput: PostStatsTotalBundleInput!,
+  $postId: ID!
+) {
+  postStatsTotalBundle(postStatsTotalBundleInput: $postStatsTotalBundleInput) {
     post { id }
     readersCount
     viewersCount
-    presentationCount
     feedClickThroughRate
-  }
-}
-`;
-
-const OP_POST_IMPACT = `
-query PostImpact($postId: ID!) {
-  postStatsTotalBundle(postId: $postId) {
-    post { id }
+    presentationCount
     followersGained
     followersLost
     netFollowerCount
     subscribersGained
     subscribersLost
     netSubscriberCount
+    __typename
+  }
+
+  postResult(id: $postId) {
+    __typename
+    ... on Post {
+      id
+      clapCount
+    }
   }
 }
 `;
 
-// util: chunk array
+// ====================================================================
+
 function chunk(arr, n) {
     const out = [];
     for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
@@ -48,25 +46,31 @@ function chunk(arr, n) {
 }
 
 async function postGraphqlBatch(operations) {
-    // operations: [{operationName, variables, query}]
     try {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+
         const res = await fetch(GRAPHQL_URL, {
             method: "POST",
             credentials: "include",
-            headers: { "Content-Type": "application/json" },
+            headers: {
+                "Content-Type": "application/json",
+                accept: "*/*",
+                "x-client-version": "web-2025.01.15",
+                "x-acquire-token": "true"
+            },
             body: JSON.stringify(operations),
             signal: controller.signal
         });
+
         clearTimeout(timeout);
-        if (!res.ok) throw new Error("GraphQL fetch failed: " + res.status);
+        if (!res.ok) throw new Error("Medium GraphQL failed: " + res.status);
+
         const text = await res.text();
-        // Medium responds with JSON lines sometimes; parse robustly
+
         try {
             return JSON.parse(text);
         } catch (e) {
-            // fallback: trim and try parse
             return JSON.parse(text.trim());
         }
     } catch (err) {
@@ -75,21 +79,27 @@ async function postGraphqlBatch(operations) {
     }
 }
 
-// Build operations array for a list of postIds. For each post id we'll create three operations (claps, totals, impact)
+// === Build operations for each post ================================
+// 2 operations per post: full bundle + claps
 function buildOperationsForIds(ids) {
     const ops = [];
     for (const id of ids) {
-        ops.push({ operationName: "PostClaps", variables: { postId: id }, query: OP_POST_CLAPS });
-        ops.push({ operationName: "PostTotals", variables: { postId: id }, query: OP_POST_TOTALS });
-        ops.push({ operationName: "PostImpact", variables: { postId: id }, query: OP_POST_IMPACT });
+        ops.push({
+            operationName: "FullPostStats",
+            variables: {
+                postStatsTotalBundleInput: { postId: id },
+                postId: id
+            },
+            query: OP_FULL_STATS
+        });
     }
     return ops;
 }
 
-// Given the responses array (in same order as operations), assemble per-post results
+// === Assemble results ===============================================
 function assembleResultsFromResponses(ids, responses) {
     const results = {};
-    // each post has 3 responses in order
+
     for (let i = 0; i < ids.length; i++) {
         const id = ids[i];
         results[id] = {
@@ -106,74 +116,76 @@ function assembleResultsFromResponses(ids, responses) {
             subscribersLost: 0,
             netSubscriberCount: 0
         };
-        const baseIndex = i * 3;
-        const respClaps = responses[baseIndex];
-        const respTotals = responses[baseIndex + 1];
-        const respImpact = responses[baseIndex + 2];
 
-        // clap
-        try {
-            const clapData = respClaps?.data?.postResult;
-            if (clapData && typeof clapData.clapCount === "number") results[id].claps = clapData.clapCount;
-        } catch (e){}
+        const resp = responses[i]; // 1 operation per post
 
-        // totals
-        try {
-            const t = respTotals?.data?.postStatsTotalBundle;
-            if (t) {
-                if (typeof t.presentationCount === "number") results[id].presentations = t.presentationCount;
-                if (typeof t.viewersCount === "number") results[id].views = t.viewersCount;
-                if (typeof t.readersCount === "number") results[id].reads = t.readersCount;
-                if (typeof t.feedClickThroughRate === "number") results[id].feedClickThroughRate = t.feedClickThroughRate;
-            }
-        } catch (e) {}
+        const bundle = resp?.data?.postStatsTotalBundle;
+        const clapsBlock = resp?.data?.postResult;
 
-        // impact
-        try {
-            const im = respImpact?.data?.postStatsTotalBundle;
-            if (im) {
-                if (typeof im.followersGained === "number") results[id].followersGained = im.followersGained;
-                if (typeof im.followersLost === "number") results[id].followersLost = im.followersLost;
-                if (typeof im.netFollowerCount === "number") results[id].netFollowerCount = im.netFollowerCount;
-                if (typeof im.subscribersGained === "number") results[id].subscribersGained = im.subscribersGained;
-                if (typeof im.subscribersLost === "number") results[id].subscribersLost = im.subscribersLost;
-                if (typeof im.netSubscriberCount === "number") results[id].netSubscriberCount = im.netSubscriberCount;
-            }
-        } catch (e) {}
+        // bundle fields
+        if (bundle) {
+            if (typeof bundle.presentationCount === "number")
+                results[id].presentations = bundle.presentationCount;
+
+            if (typeof bundle.viewersCount === "number")
+                results[id].views = bundle.viewersCount;
+
+            if (typeof bundle.readersCount === "number")
+                results[id].reads = bundle.readersCount;
+
+            if (typeof bundle.feedClickThroughRate === "number")
+                results[id].feedClickThroughRate = bundle.feedClickThroughRate;
+
+            if (typeof bundle.followersGained === "number")
+                results[id].followersGained = bundle.followersGained;
+
+            if (typeof bundle.followersLost === "number")
+                results[id].followersLost = bundle.followersLost;
+
+            if (typeof bundle.netFollowerCount === "number")
+                results[id].netFollowerCount = bundle.netFollowerCount;
+
+            if (typeof bundle.subscribersGained === "number")
+                results[id].subscribersGained = bundle.subscribersGained;
+
+            if (typeof bundle.subscribersLost === "number")
+                results[id].subscribersLost = bundle.subscribersLost;
+
+            if (typeof bundle.netSubscriberCount === "number")
+                results[id].netSubscriberCount = bundle.netSubscriberCount;
+        }
+
+        // claps
+        if (clapsBlock?.clapCount != null) {
+            results[id].claps = clapsBlock.clapCount;
+        }
     }
+
     return results;
 }
 
-// Entrypoint: collect for a list of posts (items: [{id,title,href}]).
-// We will build ops per id and send in batches of BATCH_SIZE * 3 (since 3 ops per id)
+// === Main collector ==================================================
 async function collectForItems(items) {
     const ids = items.map(i => i.id);
     if (!ids.length) return { stats: [], totals: {}, count: 0 };
 
-    // build operations in the orderly triplet pattern
     const operations = buildOperationsForIds(ids);
 
-    // chunk operations to avoid huge payloads
-    const opChunks = chunk(operations, Math.max(1, BATCH_SIZE * 3)); // BATCH_SIZE posts -> 3*BATCH_SIZE ops
+    const opChunks = chunk(operations, Math.max(1, BATCH_SIZE));
     const responses = [];
 
     for (const chunkOps of opChunks) {
         try {
-            const resBatch = await postGraphqlBatch(chunkOps);
-            // resBatch is an array of responses corresponding to chunkOps
-            // append them in same order
-            Array.prototype.push.apply(responses, resBatch);
+            const batch = await postGraphqlBatch(chunkOps);
+            responses.push(...batch);
         } catch (err) {
-            // on failure, push placeholders for each op in this chunk
-            for (let i = 0; i < chunkOps.length; i++) responses.push({ errors: [{ message: err.message }] });
+            for (let i = 0; i < chunkOps.length; i++)
+                responses.push({ errors: [{ message: err.message }] });
         }
     }
 
-    // Now responses length should equal operations length
-    // assemble per post
     const assembled = assembleResultsFromResponses(ids, responses);
 
-    // merge with titles/hrefs
     const stats = items.map(it => {
         const data = assembled[it.id] || {};
         return {
@@ -194,36 +206,36 @@ async function collectForItems(items) {
         };
     });
 
-    // totals
-    const totals = stats.reduce((acc, s) => {
-        acc.presentations += s.presentations || 0;
-        acc.views += s.views || 0;
-        acc.reads += s.reads || 0;
-        acc.claps += s.claps || 0;
-        acc.followersGained += s.followersGained || 0;
-        acc.subscribersGained += s.subscribersGained || 0;
-        return acc;
-    }, { presentations: 0, views: 0, reads: 0, claps: 0, followersGained: 0, subscribersGained: 0 });
+    const totals = stats.reduce(
+        (a, s) => {
+            a.presentations += s.presentations;
+            a.views += s.views;
+            a.reads += s.reads;
+            a.claps += s.claps;
+            a.followersGained += s.followersGained;
+            a.subscribersGained += s.subscribersGained;
+            return a;
+        },
+        { presentations: 0, views: 0, reads: 0, claps: 0, followersGained: 0, subscribersGained: 0 }
+    );
 
-    // store last result for popup quick fetch
-    await chrome.storage.local.set({ lastMediumStats: { stats, totals, count: stats.length, fetchedAt: Date.now() } });
+    await chrome.storage.local.set({
+        lastMediumStats: {
+            stats,
+            totals,
+            count: stats.length,
+            fetchedAt: Date.now()
+        }
+    });
 
     return { stats, totals, count: stats.length };
 }
 
-async function executeScript() {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        files: ["script.js"]
-    });
-}
-
+// === collectNow: scrape page =========================================
 async function collectNow() {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     if (!tab || !tab.id) throw new Error("No active tab");
 
-    // Inject code to extract posts from the current Medium page
     const scanResult = await chrome.scripting.executeScript({
         target: { tabId: tab.id },
         func: () => {
@@ -256,69 +268,79 @@ async function collectNow() {
     const items = scanResult?.[0]?.result || [];
     if (items.length === 0) return { stats: [], totals: {}, count: 0 };
 
-    // Extract postId from URL
-    const normalized = items.map(o => {
-        const match = o.href.match(/\/p\/([0-9a-f]+)|\/post\/([0-9a-f]+)/i);
-        const id = match ? (match[1] || match[2]) : null;
-        return { ...o, id };
-    }).filter(x => x.id);
-
-    if (normalized.length === 0) return { stats: [], totals: {}, count: 0 };
+    const normalized = items
+        .map(o => {
+            const match = o.href.match(/([0-9a-f]{10,})/i);
+            return { ...o, id: match ? match[1] : null };
+        })
+        .filter(x => x.id);
 
     return await collectForItems(normalized);
 }
 
+// === collectStatsForPosts ===========================================
 async function collectStatsForPosts(posts) {
-    if (!Array.isArray(posts) || posts.length === 0) {
+    if (!Array.isArray(posts) || posts.length === 0)
         throw new Error("No posts provided");
-    }
 
-    console.log('posts', posts)
-
-    const items = posts.map(p => {
-        if (typeof p === "string") {
-            // string → could be URL or postId
-            const match = p.match(/([0-9a-f]{10,})/i);
-            const id = match ? match[1] : null;
-            return { id, href: p, title: "" };
-        }
-        if (typeof p === "object") {
-            let id = p.id;
-
-            if (!id && p.href) {
-                const match = p.href.match(/([0-9a-f]{10,})/i);
-                id = match ? match[1] : null;
+    const items = posts
+        .map(p => {
+            if (typeof p === "string") {
+                const match = p.match(/([0-9a-f]{10,})/i);
+                return { id: match ? match[1] : null, href: p, title: "" };
             }
 
-            return {
-                id,
-                href: p.href || "",
-                title: p.title || ""
-            };
-        }
+            if (typeof p === "object") {
+                let id = p.id;
+                if (!id && p.href) {
+                    const match = p.href.match(/([0-9a-f]{10,})/i);
+                    id = match ? match[1] : null;
+                }
+                return { id, href: p.href || "", title: p.title || "" };
+            }
 
-        return null;
-    }).filter(x => x && x.id);
-
-    console.log('items', items)
-
-    if (items.length === 0) {
-        throw new Error("No valid post IDs extracted");
-    }
+            return null;
+        })
+        .filter(x => x && x.id);
 
     return await collectForItems(items);
 }
 
-// Message handler
+// === Message handler =================================================
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (!msg || !msg.action) {
         sendResponse({ error: "no message" });
         return true;
     }
 
-    // -------------------------------------------------------------------
-    // 1. SCAN_MEDIUM_TAB
-    // -------------------------------------------------------------------
+    if (msg.action === "collect") {
+        collectForItems(msg.posts || [])
+            .then(result => sendResponse({ ok: true, result }))
+            .catch(err => sendResponse({ error: err?.message }));
+        return true;
+    }
+
+    if (msg.action === "collectNow") {
+        collectNow()
+            .then(result => sendResponse({ ok: true, result }))
+            .catch(err => sendResponse({ error: err?.message }));
+        return true;
+    }
+
+    if (msg.action === "collectStatsForPosts") {
+        collectStatsForPosts(msg.posts || [])
+            .then(result => sendResponse({ ok: true, result }))
+            .catch(err => sendResponse({ error: err?.message }));
+        return true;
+    }
+
+    if (msg.action === "getLast") {
+        chrome.storage.local.get(["lastMediumStats"], value => {
+            sendResponse(value.lastMediumStats || null);
+        });
+        return true;
+    }
+
     if (msg.action === "SCAN_MEDIUM_TAB") {
         chrome.scripting.executeScript(
             {
@@ -329,15 +351,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                             'a[href*="/me/stats/post/"], a[href*="/p/"], a[href*="/post/"]'
                         )
                     );
-
                     const uniq = [];
                     const seen = new Set();
 
                     anchors.forEach(a => {
                         const href = a.href.split("?")[0];
                         if (seen.has(href)) return;
-
                         seen.add(href);
+
                         const title =
                             (a.querySelector("h2, h3") ||
                                 a.closest("article")?.querySelector("h2, h3") ||
@@ -351,70 +372,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             },
             results => {
                 if (chrome.runtime.lastError) {
-                    console.warn("SCAN_MEDIUM_TAB error:", chrome.runtime.lastError);
                     sendResponse({ items: [] });
                 } else {
-                    sendResponse({
-                        items: results?.[0]?.result || []
-                    });
+                    sendResponse({ items: results?.[0]?.result || [] });
                 }
             }
         );
-
         return true;
     }
 
-    // -------------------------------------------------------------------
-    // 2. collect  (Original collector handler)
-    // -------------------------------------------------------------------
-    if (msg.action === "collect") {
-        const items = msg.posts || [];
-
-        collectForItems(items)
-            .then(result => sendResponse({ ok: true, result }))
-            .catch(err => sendResponse({ error: err?.message || String(err) }));
-
-        return true;
-    }
-
-    // -------------------------------------------------------------------
-    // 3. getLast — return last saved stats from storage
-    // -------------------------------------------------------------------
-    if (msg.action === "getLast") {
-        chrome.storage.local.get(["lastMediumStats"], value => {
-            sendResponse(value.lastMediumStats || null);
-        });
-
-        return true;
-    }
-
-    // -------------------------------------------------------------------
-    // 4. collectNow — triggered manually from UI (popup)
-    // -------------------------------------------------------------------
-    if (msg.action === "collectNow") {
-        collectNow()
-            .then(result => sendResponse({ ok: true, result }))
-            .catch(err => sendResponse({ error: err?.message || String(err) }));
-
-        return true;
-    }
-
-    // -------------------------------------------------------------------
-    // 5. collectStatsForPosts — takes a list of post IDs or URLs
-    // -------------------------------------------------------------------
-    if (msg.action === "collectStatsForPosts") {
-        const posts = msg.posts || [];
-
-        collectStatsForPosts(posts)
-            .then(result => sendResponse({ ok: true, result }))
-            .catch(err => sendResponse({ error: err?.message || String(err) }));
-
-        return true;
-    }
-
-    // -------------------------------------------------------------------
-    // Unknown action fallback
-    // -------------------------------------------------------------------
     sendResponse({ error: "unknown action" });
     return false;
 });

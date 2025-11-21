@@ -78,6 +78,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
 });
 
+// Medium SPA: re-run on navigation
+document.addEventListener("readystatechange", () => {
+    if (document.readyState === "complete") {
+        gatherAndSend().then(r => {}).catch(() => {});
+    }
+});
+
 // auto-run to warm up
 // (we won't auto-fetch network data here; only gather IDs and let background know we have them)
 gatherAndSend().catch(() => {});
