@@ -22,8 +22,10 @@
   "content_scripts": [
     {
       "matches": [
-        "https://medium.com/me/stats*",
-        "https://*.medium.com/me/stats*"
+        "https://medium.com/*stats*",
+        "https://*.medium.com/*stats*",
+        "https://medium.com/p/*",
+        "https://*.medium.com/p/*"
       ],
       "js": ["content.js"],
       "run_at": "document_idle"
